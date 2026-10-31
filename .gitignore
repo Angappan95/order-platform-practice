@@ -1,0 +1,7 @@
+.github/instructions/wmt-copilot.instructions.md
+.github
+.venv
+.wibey
+.vscode
+.env
+*.pyc
