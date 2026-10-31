@@ -30,3 +30,6 @@ dev = [
     "respx>=0.23.1",
     "ruff>=0.17.3",
 ]
+
+[tool.pytest.ini_options]
+pythonpath = ["."]

@@ -20,6 +20,7 @@
 ### Learning path
 
 ```mermaid
+%% Learning path from a simple endpoint to a full reliability platform.
 flowchart TD
   A[Simple FastAPI endpoint] --> B[Durable, idempotent order write]
   B --> C[Bounded downstream calls]
@@ -33,6 +34,7 @@ flowchart TD
 ### How to work each lab
 
 ```mermaid
+%% Per-lab loop: run, break, observe, fix, verify.
 flowchart LR
   R[1. Read the failure] --> U[2. Run the baseline]
   U --> B[3. Break it deliberately]
@@ -88,6 +90,7 @@ The decision guide near the end expands these choices.
 By the end, learners have evolved a single `order-service` into a small but realistic order platform.
 
 ```mermaid
+%% Target system: order service and its downstream dependencies.
 flowchart LR
   C[Web / AI client] --> G[API Gateway]
   G --> O[Order service]
@@ -131,6 +134,7 @@ This course deliberately uses **two environments**, in sequence. Do not attempt 
 | **Platform translation** | 8 and the Kubernetes parts of 12-13 | `kind` or `minikube` plus Istio | Kubernetes `Service` + CoreDNS; ingress/gateway; Envoy sidecar | Recreating every local lab inside a cluster |
 
 ```mermaid
+%% Environment split: Compose on a laptop (Labs 0-7) vs. Kubernetes + Istio (Lab 8+).
 flowchart LR
   subgraph Local["Labs 0-7: Docker Compose on your laptop"]
     LClient[Client] --> LKong[Kong :8000]
@@ -168,6 +172,7 @@ Unless explicitly marked **CONCEPT**, code is written to be copied as a starting
 At every lab, keep this evidence in a `notes.md` file: command run, expected output, observed failure, applied change, and retest output. This turns the course into an auditable engineering exercise rather than passive reading.
 
 ```text
+# Lab evidence files kept under notes/, one per lab.
 notes/
   lab-02-idempotency.md     # duplicate request evidence and database query result
   lab-03-resilience.md      # timeout/breaker metrics and recovery observation
@@ -187,6 +192,7 @@ notes/
 ### Create the workspace
 
 ```bash
+# Scaffold the project folder and install dependencies with uv.
 mkdir -p fastapi-production-workshop/{services,infra,k8s}
 cd fastapi-production-workshop
 uv init
@@ -203,6 +209,7 @@ All application code lives under `services/order_service/app/`. Every file path 
 Create the directories first, then the package marker files, so imports work the same from a terminal, a test runner, and a container. `touch` does not create missing parent folders, so `mkdir -p` must run before it:
 
 ```bash
+# Create the service package folders and __init__.py markers.
 mkdir -p services/order_service/app/{api,application,domain,infrastructure} \
   services/mock_dependency infra/gateway tests/contracts notes
 touch services/__init__.py services/order_service/__init__.py \
@@ -214,6 +221,7 @@ touch services/__init__.py services/order_service/__init__.py \
 Create `.env.example`. Labs 0-3 run FastAPI on the host, so Kafka uses `localhost`; the host process cannot resolve the Compose name `redpanda`. Lab 4 uses `infra/.env.compose` for container hostnames.
 
 ```dotenv
+# Host-process settings for Labs 0-3 (localhost hostnames).
 DATABASE_URL=postgresql+asyncpg://orders:orders@localhost:5432/orders
 INVENTORY_URL=http://localhost:8002
 PAYMENT_URL=http://localhost:8003
@@ -223,6 +231,7 @@ KAFKA_BOOTSTRAP_SERVERS=localhost:9092
 Ignore it, then copy it:
 
 ```bash
+# Git-ignore .env and create your local copy.
 echo ".env" >> .gitignore
 cp .env.example .env
 ```
@@ -233,6 +242,7 @@ cp .env.example .env
 Suggested layout after Lab 5:
 
 ```text
+# Target repository layout; built up across labs, not all at once.
 .env.example
 .env                           # copied from .env.example; git-ignored
 pyproject.toml
@@ -277,9 +287,14 @@ Routes only translate HTTP into an application command. Domain rules do not impo
 
 ## Step 0.1: configuration belongs in environment, not source code
 
+**Problem:** hard-coded database URLs and hostnames work on one laptop and fail everywhere else, and credentials end up in Git.
+
+**Pattern:** read configuration from environment variables once, cache it, and fail at startup when a required value is missing.
+
 Create `services/order_service/app/config.py`:
 
 ```python
+# Environment-based settings, loaded once and cached per process.
 import os
 from functools import lru_cache
 
@@ -298,12 +313,28 @@ def get_settings():
     return Settings()
 ```
 
-**Try it:** while FastAPI runs on your laptop in Labs 0-3, set `DATABASE_URL=postgresql+asyncpg://orders:orders@localhost:5432/orders`. Start without it once. The service should fail at startup rather than serving traffic with a broken configuration. In Lab 4, the app moves into Compose and the hostname changes to `postgres`; the two environment files make that explicit.
+**Verify:** check that a missing value fails and a provided value loads.
+
+```bash
+# Without DATABASE_URL: expect KeyError: 'DATABASE_URL'
+env -u DATABASE_URL uv run python -c "from services.order_service.app.config import get_settings; get_settings()"
+
+# With DATABASE_URL: expect the URL printed back
+DATABASE_URL=postgresql+asyncpg://orders:orders@localhost:5432/orders \
+  uv run python -c "from services.order_service.app.config import get_settings; print(get_settings().database_url)"
+```
+
+In Lab 4, the app moves into Compose and the hostname changes to `postgres`; the two environment files make that explicit.
 
 ## Step 0.2: use an app factory and lifespan
 
+**Problem:** if the pool and clients are created at import time or per request, the service either starts broken, leaks connections, or cannot shut down cleanly.
+
+**Pattern:** an app factory builds the application. A lifespan hook creates shared resources once at startup and closes them at shutdown. `/livez` answers "is the process alive?"; `/readyz` answers "can it take traffic?"
+
 ```python
 # services/order_service/app/main.py
+# App factory with lifespan hooks and liveness/readiness endpoints.
 from contextlib import asynccontextmanager
 from fastapi import FastAPI
 from .config import get_settings
@@ -338,8 +369,17 @@ app = create_app()
 Run it:
 
 ```bash
+# Start the service with uvicorn and check liveness.
 uv run uvicorn services.order_service.app.main:app --env-file .env --reload --port 8000
 curl localhost:8000/livez
+```
+
+**Verify:**
+
+```bash
+curl -s localhost:8000/livez    # expect {"status":"alive"}
+curl -s localhost:8000/readyz   # expect {"status":"ready"}
+# Stop uvicorn with Ctrl+C: it should exit after the lifespan shutdown, without a traceback.
 ```
 
 ### Failure clinic
@@ -361,10 +401,15 @@ curl localhost:8000/livez
 
 ## Step 1.1: make the HTTP contract explicit
 
+**Problem:** the endpoint accepts any JSON. Bad values reach business code and the database, and hand-written checks drift away from what the API documents.
+
+**Pattern:** Pydantic models declare the contract once. FastAPI validates at the HTTP boundary and generates OpenAPI from the same types.
+
 Request bodies are declared as Pydantic models. FastAPI validates every field before the handler runs, generates OpenAPI documentation from the same models, and passes the handler typed objects instead of raw dictionaries.
 
 ```python
 # services/order_service/app/api/orders.py
+# Step 1.1: Pydantic request models and a stub POST /v1/orders endpoint.
 from uuid import UUID
 from decimal import Decimal
 from fastapi import APIRouter, Header, status
@@ -399,8 +444,13 @@ Key decisions:
 
 ## Step 1.2: return one error shape
 
+**Problem:** each failure returns a different shape. Clients cannot write one error handler, and internal exception text leaks to callers.
+
+**Pattern:** one exception type for business errors and one handler for validation errors, both returning the same JSON structure. The trace ID is attached at the boundary, so Lab 8 can replace it with the real OpenTelemetry trace ID.
+
 ```python
 # services/order_service/app/api/errors.py
+# Step 1.2: domain and validation exception handlers returning one error shape.
 from uuid import uuid4
 
 from fastapi import FastAPI
@@ -443,6 +493,7 @@ Register the router and handlers in `create_app()`. Then send invalid data:
 
 ```python
 # services/order_service/app/main.py — add these imports
+# Register the error handlers and router in create_app().
 from .api.errors import install_error_handlers
 from .api.orders import router as orders_router
 
@@ -452,6 +503,7 @@ app.include_router(orders_router)
 ```
 
 ```bash
+# Send an invalid request to confirm the 422 error shape.
 curl -i -X POST localhost:8000/v1/orders \
   -H 'content-type: application/json' -H 'Idempotency-Key: a-very-long-client-generated-key' \
   -d '{"customer_id":"not-a-uuid","lines":[]}'
@@ -459,9 +511,28 @@ curl -i -X POST localhost:8000/v1/orders \
 
 FastAPI’s 422 validation response is useful, but standardize it too if your API has an external contract.
 
+**Verify Steps 1.1 and 1.2:** the server from Lab 0 must be running. An invalid body returns the shared error shape, and a valid body returns `202`.
+
+```bash
+curl -s -X POST localhost:8000/v1/orders -H 'content-type: application/json' \
+  -H 'Idempotency-Key: a-very-long-client-generated-key' \
+  -d '{"customer_id":"not-a-uuid","lines":[]}' | python3 -m json.tool
+# expect "code": "VALIDATION_ERROR", a "trace_id", and "details" naming customer_id and lines
+
+curl -s -o /dev/null -w "%{http_code}\n" -X POST localhost:8000/v1/orders \
+  -H 'content-type: application/json' -H 'Idempotency-Key: a-very-long-client-generated-key' \
+  -d '{"customer_id":"11111111-1111-1111-1111-111111111111","lines":[{"sku":"SKU-001","quantity":1,"unit_price":"49.90"}]}'
+# expect 202
+```
+
 ## Step 1.3: understand async is not magic
 
+**Problem:** one blocking call inside `async def` (for example `time.sleep`) freezes the event loop, so unrelated requests on that worker wait too.
+
+**Pattern:** use async clients for I/O, so the loop can serve other requests while one waits. Send CPU-heavy work to worker processes, not the event loop.
+
 ```python
+# Blocking vs. non-blocking handlers under async def.
 # Wrong: blocks every request sharing this event loop worker.
 @router.get("/wrong")
 async def wrong():
@@ -480,6 +551,22 @@ async def right():
 
 For CPU-heavy tokenization, document parsing, or local model inference, use a worker system (Celery/Arq/Temporal/Kubernetes Job) or a process pool. `async def` does not make CPU work parallel.
 
+**Verify:** add the two handlers temporarily to `services/order_service/app/api/orders.py`, so they are served at `/v1/orders/wrong` and `/v1/orders/right`. In `/right`, point the URL at `http://localhost:8000/livez`, since `example.internal` does not resolve.
+
+```bash
+# Blocking: /livez waits behind the 2-second time.sleep in /wrong
+curl -s localhost:8000/v1/orders/wrong > /dev/null & sleep 0.2
+time curl -s localhost:8000/livez
+# expect roughly 2 seconds
+
+# Non-blocking: /livez answers immediately while /right waits on httpx
+curl -s localhost:8000/v1/orders/right > /dev/null & sleep 0.2
+time curl -s localhost:8000/livez
+# expect well under 0.5 seconds
+```
+
+Remove both temporary handlers after the check.
+
 ### Failure clinic
 
 | Symptom | Root cause | Fix |
@@ -497,8 +584,14 @@ For CPU-heavy tokenization, document parsing, or local model inference, use a wo
 
 ## Step 2.1: define persistence boundaries
 
+**Problem:** the in-memory `dict` loses every order on restart, and each replica keeps its own copy, so the same request can succeed on one replica and miss on another.
+
+**Pattern:** store orders in Postgres. Each process owns one connection pool with a fixed size, and each request gets its own session from that pool.
+
 ```python
 # services/order_service/app/infrastructure/db.py
+# Creates one connection pool per process and a per-request session dependency.
+# pool_pre_ping drops dead connections; expire_on_commit=False avoids lazy loads in async code.
 from sqlalchemy.ext.asyncio import async_sessionmaker, create_async_engine
 from ..config import get_settings
 
@@ -516,6 +609,7 @@ async def get_session():
 For the first local run, save this as `infra/sql/001_orders.sql`. The course executes it directly so you can focus on the behavior. In a production repository, commit the same change as an Alembic migration; Lab 13 covers the safe evolution rule.
 
 ```sql
+-- Core tables for orders and idempotency keys (Lab 2).
 CREATE TABLE orders (
   id UUID PRIMARY KEY,
   customer_id UUID NOT NULL,
@@ -533,8 +627,13 @@ CREATE TABLE idempotency_keys (
 
 ## Step 2.2: enforce idempotency atomically
 
+**Problem:** a client retries a `POST` after a timeout. If the code first checks whether the key exists and then inserts, two concurrent retries can both pass the check and create two orders.
+
+**Pattern:** store the idempotency key under a unique constraint and let the insert decide the winner inside one transaction. The losing request reads the existing result instead of creating an order.
+
 ```python
 # services/order_service/app/application/create_order.py
+# Step 2.2: atomic idempotent order insert in one transaction.
 from hashlib import sha256
 from json import dumps
 from uuid import uuid4
@@ -557,6 +656,8 @@ async def create_order(session, command, idempotency_key):
         """), {"key": idempotency_key, "hash": request_hash, "order_id": order_id})
         inserted = result.scalar_one_or_none()
 
+        # ON CONFLICT DO NOTHING returned no row: the key already exists.
+        # Same request hash = safe retry, return the original order. Different hash = key reused for another payload.
         if inserted is None:
             existing = await session.execute(text(
               "SELECT request_hash, order_id FROM idempotency_keys WHERE key = :key"),
@@ -581,9 +682,14 @@ The unique key is the concurrency control. Checking first with `SELECT` is race-
 
 ## Step 2.2b: replace the Lab 1 stub with the real write path
 
+**Problem:** the Lab 1 endpoint returns a fake order and never touches the database or the idempotency logic.
+
+**Pattern:** the route takes a database session from a dependency and passes the validated body to the application function, so HTTP, transaction, and business rules each stay in one place.
+
 In `services/order_service/app/api/orders.py`, replace the temporary Lab 1 endpoint with this version. This is the missing wiring between HTTP, the database session, and the application function above.
 
 ```python
+# Step 2.2b: real write path wired to the DB session and create_order().
 from fastapi import APIRouter, Depends, Header, status
 from ..infrastructure.db import get_session
 from ..application.create_order import create_order as persist_order
@@ -609,10 +715,33 @@ async def create_order_endpoint(
 
 Now run the same request twice. The first response has `idempotent_replay: false`; the second has `true` and the same `order_id`.
 
+**Verify the concurrency guarantee:** send five identical requests in parallel, then send the same key with a different body.
+
+```bash
+ORDERS_BEFORE=$(docker compose -f infra/compose.yaml exec -T postgres psql -U orders -d orders -tAc "select count(*) from orders;")
+for i in 1 2 3 4 5; do
+  curl -s -o /dev/null -w "%{http_code} " -X POST localhost:8000/v1/orders -H 'content-type: application/json' \
+    -H 'Idempotency-Key: race-demo-key-0001' \
+    -d '{"customer_id":"11111111-1111-1111-1111-111111111111","lines":[{"sku":"SKU-001","quantity":1,"unit_price":"49.90"}]}' &
+done; wait; echo
+ORDERS_AFTER=$(docker compose -f infra/compose.yaml exec -T postgres psql -U orders -d orders -tAc "select count(*) from orders;")
+echo "new orders: $((ORDERS_AFTER - ORDERS_BEFORE))"   # expect 1
+
+# Same key, different cart: expect 422 IDEMPOTENCY_KEY_REUSED
+curl -s -X POST localhost:8000/v1/orders -H 'content-type: application/json' \
+  -H 'Idempotency-Key: race-demo-key-0001' \
+  -d '{"customer_id":"11111111-1111-1111-1111-111111111111","lines":[{"sku":"SKU-002","quantity":3,"unit_price":"10.00"}]}'
+```
+
 ## Step 2.3: run local dependencies
+
+**Problem:** the schema must exist before the first request, and every learner's database must match.
+
+**Pattern:** start Postgres and Redpanda in Compose and load the reviewed schema file explicitly. The application never creates tables on startup.
 
 ```yaml
 # infra/compose.yaml
+# Local Postgres and Redpanda containers for Labs 0-3.
 services:
   postgres:
     image: postgres:16-alpine
@@ -633,6 +762,7 @@ services:
 ```
 
 ```bash
+# Start dependencies, load the schema, and confirm the tables exist.
 # Labs 0-3 run FastAPI on the host; only dependencies run in Compose.
 docker compose -f infra/compose.yaml up -d postgres redpanda
 docker compose -f infra/compose.yaml exec -T postgres \
@@ -643,7 +773,26 @@ docker compose -f infra/compose.yaml exec -T postgres \
   psql -U orders -d orders -c '\dt'
 ```
 
-Expected result: `orders` and `idempotency_keys` appear in the table list. If the database is reset, rerun the same schema file. Do not make the application run DDL on startup; in a production service the deployment pipeline executes a reviewed migration before enabling new code.
+Expected result: `orders` and `idempotency_keys` appear in the table list.
+
+**Verify the connection pool:** the app and the database can talk through the same engine.
+
+```bash
+uv run --env-file .env python -c "
+import asyncio
+from sqlalchemy import text
+from services.order_service.app.infrastructure.db import engine
+
+async def check():
+    async with engine.connect() as conn:
+        print((await conn.execute(text('select 1'))).scalar())
+
+asyncio.run(check())
+"
+# expect 1
+```
+
+If the database is reset, rerun the same schema file. Do not make the application run DDL on startup; in a production service the deployment pipeline executes a reviewed migration before enabling new code.
 
 ### Failure clinic
 
@@ -665,11 +814,16 @@ Expected result: `orders` and `idempotency_keys` appear in the table list. If th
 
 ## Step 3.0: start deterministic local dependencies
 
+**Problem:** a real payment provider cannot be made slow or broken on demand, so timeout and failure behavior cannot be repeated or tested.
+
+**Pattern:** small mock services whose delay and failure mode come from environment variables. The same module runs locally and in Compose, so only the hostname changes.
+
 Labs 0-3 run FastAPI on the host, so use two intentionally small mock services on your laptop. They make timeout and failure behavior repeatable without a real payment provider.
 
 Create `services/mock_dependency/main.py`:
 
 ```python
+# Deterministic mock dependency with configurable delay and failure modes.
 import asyncio
 import os
 from uuid import uuid4
@@ -700,6 +854,7 @@ async def reserve():
 Start the mocks in separate terminals:
 
 ```bash
+# Run the two mock dependencies on separate ports and verify health.
 # Terminal 1: inventory mock
 DEPENDENCY_NAME=inventory uv run uvicorn services.mock_dependency.main:app --port 8002
 
@@ -713,10 +868,22 @@ curl http://localhost:8003/health
 
 Expected result: each health endpoint returns its dependency name and `status: ok`. Lab 4 runs the exact same mock module as Compose services, so the only thing that changes is the hostname.
 
+**Verify the failure switch:** restart the payment mock (terminal 2) with `FAIL_MODE=500`, then check it, then restart it without the variable.
+
+```bash
+curl -s -o /dev/null -w "%{http_code}\n" -X POST localhost:8003/authorizations   # expect 500
+curl -s -o /dev/null -w "%{http_code}\n" -X POST localhost:8003/authorizations   # after restart without FAIL_MODE: expect 200
+```
+
 ## Step 3.1: give every remote call a budget
+
+**Problem:** a slow payment call holds the request open. Each retry adds load to a service that is already struggling, and the outage spreads to checkout.
+
+**Pattern:** give every remote call a timeout. A circuit breaker counts dependency-availability failures; after too many, it opens and fails calls immediately without touching the network. After a cooldown it lets one probe through (half-open) and closes again only if that probe succeeds.
 
 ```python
 # services/order_service/app/infrastructure/payment_client.py
+# Step 3.1: payment client with timeouts, circuit breaker, and error mapping.
 import httpx
 from datetime import timedelta
 from aiobreaker import CircuitBreaker
@@ -765,11 +932,161 @@ class PaymentClient:
 
 Use retry only for *transient*, *safe/idempotent* calls. Give a request one end-to-end deadline; do not independently spend 1 second in each of five downstream calls.
 
-## Step 3.2: use a bulkhead for a fragile dependency
+**Verify the timeout:** with a 3-second delay, the call must fail at the 0.8-second read timeout, not after 3 seconds.
+
+```bash
+# Terminal 2: restart the payment mock with a 3-second delay and no FAIL_MODE
+DELAY_SECONDS=3 DEPENDENCY_NAME=payment uv run uvicorn services.mock_dependency.main:app --port 8003
+
+# Terminal 3: one call, timed
+time uv run --env-file .env python - <<'EOF'
+import asyncio, httpx
+from services.order_service.app.infrastructure.payment_client import PaymentClient
+
+async def main():
+    async with httpx.AsyncClient() as http:
+        try:
+            await PaymentClient("http://localhost:8003", http).authorize("o-timeout", 10)
+            print("ok")
+        except Exception as exc:
+            print(type(exc).__name__)
+
+asyncio.run(main())
+EOF
+# expect PaymentUnavailable, and real time around 1 s (not 3 s)
+```
+
+**Verify the circuit breaker:** run the automated test first, then the manual check against the mock.
+
+Create `tests/test_payment_breaker.py`:
 
 ```python
+# tests/test_payment_breaker.py
+import httpx
+import pytest
+from aiobreaker import CircuitBreakerError
+
+from services.order_service.app.infrastructure.payment_client import (
+    PaymentClient,
+    PaymentDeclined,
+    PaymentUnavailable,
+    payment_breaker,
+)
+
+
+class FixedStatusTransport:
+    def __init__(self, status_code):
+        self.status_code = status_code
+        self.calls = 0
+
+    async def post(self, url, **kwargs):
+        self.calls += 1
+        return httpx.Response(self.status_code, request=httpx.Request("POST", url))
+
+
+@pytest.fixture(autouse=True)
+def reset_breaker():
+    payment_breaker.close()
+    yield
+    payment_breaker.close()
+
+
+@pytest.mark.asyncio
+async def test_breaker_opens_after_five_unavailable_responses():
+    transport = FixedStatusTransport(500)
+    client = PaymentClient("http://payment.com", transport)
+
+    for _ in range(4):
+        with pytest.raises(PaymentUnavailable):
+            await client.authorize("order-1", 10)
+
+    with pytest.raises(CircuitBreakerError):  # 5th failure opens the circuit
+        await client.authorize("order-1", 10)
+
+    calls_before = transport.calls
+    with pytest.raises(CircuitBreakerError):  # open circuit: no request sent
+        await client.authorize("order-1", 10)
+    assert transport.calls == calls_before
+
+
+@pytest.mark.asyncio
+async def test_declines_never_open_the_breaker():
+    transport = FixedStatusTransport(402)
+    client = PaymentClient("http://payment", transport)
+
+    for _ in range(10):
+        with pytest.raises(PaymentDeclined):
+            await client.authorize("o-1", 10)
+```
+
+```bash
+uv run pytest tests/test_payment_breaker.py -v
+# expect both tests PASSED
+```
+
+Manual check against the real mock: one Python process makes calls, so the breaker state lives for that run.
+
+```bash
+# Terminal 2: payment mock failing every authorization
+FAIL_MODE=500 DEPENDENCY_NAME=payment uv run uvicorn services.mock_dependency.main:app --port 8003
+
+# Terminal 3: calls 0-4 reach the mock and return PaymentUnavailable; calls 5-6 raise CircuitBreakerError
+uv run --env-file .env python - <<'EOF'
+import asyncio, httpx
+from services.order_service.app.infrastructure.payment_client import PaymentClient
+
+async def main():
+    async with httpx.AsyncClient() as http:
+        client = PaymentClient("http://localhost:8003", http)
+        for i in range(7):
+            try:
+                await client.authorize(f"o-{i}", 10)
+                print(i, "ok")
+            except Exception as exc:
+                print(i, type(exc).__name__)
+
+asyncio.run(main())
+EOF
+# Terminal 2 log: only 5 "POST /authorizations 500" lines. Calls 5-6 never reached the mock.
+```
+
+Recovery (half-open): this script waits 40 seconds after the circuit opens. Restart the mock without `FAIL_MODE` during that wait.
+
+```bash
+uv run --env-file .env python - <<'EOF'
+import asyncio, httpx
+from services.order_service.app.infrastructure.payment_client import PaymentClient
+
+async def main():
+    async with httpx.AsyncClient() as http:
+        client = PaymentClient("http://localhost:8003", http)
+        for i in range(5):
+            try:
+                await client.authorize(f"o-{i}", 10)
+            except Exception:
+                pass  # expected: PaymentUnavailable while FAIL_MODE=500
+        print("Restart the payment mock WITHOUT FAIL_MODE within 40 seconds...")
+        await asyncio.sleep(40)  # longer than timeout_duration (30 seconds)
+        print("probe:", await client.authorize("o-probe", 10))  # half-open probe succeeds
+        print("after:", await client.authorize("o-after", 10))  # circuit is closed again
+asyncio.run(main())
+EOF
+# expect a probe result and an "after" result, not CircuitBreakerError
+```
+
+## Step 3.2: use a bulkhead for a fragile dependency
+
+**Problem:** when payment slows down, every incoming request waits for it. Even with timeouts, a traffic spike can start thousands of payment calls on one replica and exhaust its connections and memory.
+
+**Pattern:** a bulkhead (a semaphore) caps how many payment calls one replica runs at once. Extra requests either wait briefly or receive `503` right away, so the failure stays inside the payment path.
+
+```python
+# services/order_service/app/application/authorize_payment.py
+# Step 3.2: bulkhead semaphore around the payment call.
 import asyncio
+from aiobreaker import CircuitBreakerError
 from ..api.errors import DomainError
+from ..infrastructure.payment_client import PaymentDeclined, PaymentUnavailable
 
 payment_slots = asyncio.Semaphore(20)
 
@@ -780,7 +1097,8 @@ async def authorize_with_bulkhead(client, order_id, total):
                 return await client.authorize(order_id, total)
     except TimeoutError:
         raise DomainError("PAYMENT_UNAVAILABLE", "Try again later", 503)
-    except PaymentUnavailable:
+    except (PaymentUnavailable, CircuitBreakerError):
+        # CircuitBreakerError means the breaker is open: payment is treated as unavailable without a network call.
         raise DomainError("PAYMENT_UNAVAILABLE", "Try again later", 503)
     except PaymentDeclined:
         raise DomainError("PAYMENT_DECLINED", "Payment was declined", 402)
@@ -788,9 +1106,65 @@ async def authorize_with_bulkhead(client, order_id, total):
 
 The semaphore is a **local bulkhead**, not a distributed rate limit. It prevents 1,000 incoming requests from creating 1,000 in-flight payment calls per replica. Keep the limit observable and tune it against payment capacity.
 
+**Verify the bulkhead and the error mapping:** create `tests/test_authorize_payment.py`.
+
+```python
+# tests/test_authorize_payment.py
+import asyncio
+
+import pytest
+
+from services.order_service.app.api.errors import DomainError
+from services.order_service.app.application.authorize_payment import authorize_with_bulkhead
+from services.order_service.app.infrastructure.payment_client import PaymentUnavailable
+
+
+class SlowClient:
+    def __init__(self):
+        self.in_flight = 0
+        self.peak = 0
+
+    async def authorize(self, order_id, total):
+        self.in_flight += 1
+        self.peak = max(self.peak, self.in_flight)
+        await asyncio.sleep(0.05)
+        self.in_flight -= 1
+        return "auth-1"
+
+
+class UnavailableClient:
+    async def authorize(self, order_id, total):
+        raise PaymentUnavailable("payment down")
+
+
+@pytest.mark.asyncio
+async def test_bulkhead_caps_concurrent_payment_calls():
+    client = SlowClient()
+    await asyncio.gather(*(authorize_with_bulkhead(client, f"o-{i}", 10) for i in range(100)))
+    assert client.peak <= 20
+
+
+@pytest.mark.asyncio
+async def test_unavailable_payment_maps_to_503():
+    with pytest.raises(DomainError) as exc:
+        await authorize_with_bulkhead(UnavailableClient(), "o-1", 10)
+    assert exc.value.status_code == 503
+```
+
+```bash
+uv run pytest tests/test_authorize_payment.py -v
+# expect both tests PASSED: peak concurrency never exceeds 20, and PaymentUnavailable becomes a 503
+```
+
 ## Step 3.3: make failures visible
 
+**Problem:** when a call fails, the caller sees a generic 500 or a raw provider error. On-call engineers cannot tell a timeout from an open breaker from a full bulkhead.
+
+**Pattern:** map each dependency failure to a stable `503` with a retry hint, hide provider details, and emit metrics for the signals that explain the failure: duration, breaker state, timeouts, and bulkhead occupancy.
+
 Return `503` plus a safe retry hint when the request cannot proceed. Do not reveal payment provider errors. Emit metrics: request duration, breaker state, downstream timeout count, and in-flight bulkhead slots.
+
+**Verify:** the `test_unavailable_payment_maps_to_503` test above checks the status code. Through the shared handler from Lab 1, the body is `{"code": "PAYMENT_UNAVAILABLE", "message": "Try again later", "trace_id": "..."}`, with no provider text.
 
 ### Failure clinic
 
@@ -812,6 +1186,10 @@ Return `503` plus a safe retry hint when the request cannot proceed. Do not reve
 
 ## Step 4.1: define the gateway boundary — local Compose implementation
 
+**Problem:** clients call each service directly, carry internal addresses, and each service repeats authentication, CORS, and rate limiting in its own way.
+
+**Pattern:** one gateway at the edge owns the public API: routing, authentication, rate limits, and request limits. The business logic stays in the services.
+
 **Environment for this lab: Docker Compose only.** You are moving from Labs 0-3, where the FastAPI process ran on your host and Postgres/Redpanda ran in containers, to a local multi-container system. Kubernetes appears for the first time in Lab 8.
 
 The API gateway is the north-south edge. It performs API authentication, coarse rate limits, request-size limits, routing/versioning, TLS termination, and audit correlation. It should **not** contain order business rules or become a database-backed monolith.
@@ -819,6 +1197,7 @@ The API gateway is the north-south edge. It performs API authentication, coarse 
 The local request path is deliberately simple:
 
 ```mermaid
+%% Local request path: client to Kong to order-service.
 sequenceDiagram
   participant C as curl / AI client
   participant G as Kong localhost:8000
@@ -831,9 +1210,14 @@ sequenceDiagram
 
 ### Step 4.1a: add the container image used from this point onward
 
+**Problem:** the laptop, Compose, and Kubernetes can each run different dependency versions, so "it passed locally" proves little.
+
+**Pattern:** build one immutable image from the locked dependencies and run that same image everywhere.
+
 Create `services/order_service/Dockerfile`. Lab 8 reuses this same immutable image; it does not introduce a second packaging approach.
 
 ```dockerfile
+# Container image for the order service, reused unchanged through Lab 8.
 FROM python:3.12-slim
 WORKDIR /app
 RUN useradd --system --create-home appuser
@@ -847,11 +1231,24 @@ EXPOSE 8000
 CMD ["uv", "run", "uvicorn", "services.order_service.app.main:app", "--host", "0.0.0.0", "--port", "8000"]
 ```
 
+**Verify the image:** build it and import the application inside the container.
+
+```bash
+docker build -t order-service:workshop -f services/order_service/Dockerfile .
+docker run --rm order-service:workshop uv run python -c "from services.order_service.app.main import app; print(app.title)"
+# expect: Order Service
+```
+
 ### Step 4.1b: run Kong and the service in Compose
+
+**Problem:** the application runs on the host, so nothing has one stable entry point, and each dependency needs a different address on each machine.
+
+**Pattern:** put every service on the Compose network, where they reach each other by service name. Kong is the only service with a host port.
 
 Create `infra/.env.compose`. Its hostnames are Compose service names, not laptop hostnames:
 
 ```dotenv
+# Compose-network hostnames for containers (Lab 4+).
 DATABASE_URL=postgresql+asyncpg://orders:orders@postgres:5432/orders
 INVENTORY_URL=http://inventory-service:8000
 PAYMENT_URL=http://payment-service:8000
@@ -861,6 +1258,7 @@ KAFKA_BOOTSTRAP_SERVERS=redpanda:9092
 Add these services to `infra/compose.yaml` below the existing Postgres and Redpanda services:
 
 ```yaml
+# order-service, inventory/payment mocks, and Kong added to infra/compose.yaml.
   order-service:
     build:
       context: ..
@@ -910,9 +1308,14 @@ Add these services to `infra/compose.yaml` below the existing Postgres and Redpa
 
 ### Step 4.1c: configure Kong with a path that actually matches FastAPI
 
+**Problem:** clients call `/api/v1/orders`, but FastAPI serves `/v1/orders`. Rate limits and payload limits are also needed at the edge, not repeated in every service.
+
+**Pattern:** the gateway owns the public path, strips the prefix before forwarding, and applies coarse rate and size limits.
+
 Create `infra/gateway/kong.yml`:
 
 ```yaml
+# Kong routes /api to order-service with rate and request-size limits.
 _format_version: "3.0"
 services:
   - name: order-service
@@ -933,9 +1336,24 @@ services:
 
 `strip_path: true` is essential here. It maps the external `/api/v1/orders` route to FastAPI's internal `/v1/orders` route. The earlier `strip_path: false` example would have forwarded `/api/v1/orders` and resulted in a FastAPI 404.
 
-### Step 4.1d: start and verify the boundary
+**Verify the gateway:** the internal path must be unreachable through Kong, and the rate limit must trigger.
 
 ```bash
+# expect 404: Kong has no route for /v1/orders
+curl -s -o /dev/null -w "%{http_code}\n" localhost:8000/v1/orders
+
+# expect a count with some 429 lines: 61 requests in one minute exceed the 60-per-minute limit
+for i in $(seq 1 61); do curl -s -o /dev/null -w "%{http_code}\n" localhost:8000/api/livez; done | sort | uniq -c
+```
+
+### Step 4.1d: start and verify the boundary
+
+**Problem:** a configuration can look right in files and still fail when started together.
+
+**Pattern:** start the full Compose stack once, then test the public path and the blocked internal path from the host.
+
+```bash
+# Start the stack and verify the Kong /api boundary.
 docker compose -f infra/compose.yaml up --build -d
 docker compose -f infra/compose.yaml ps
 curl -i http://localhost:8000/api/livez
@@ -951,6 +1369,10 @@ In the service, trust forwarded identity headers only when requests can come exc
 
 ## Step 4.2: service discovery — Compose now, Kubernetes later
 
+**Problem:** hard-coded IP addresses change whenever a container or Pod restarts, so calls to a dependency fail after a redeploy.
+
+**Pattern:** call a stable name and let DNS resolve it to a healthy instance. The name is the contract; the address is an implementation detail.
+
 | Environment | This course uses it in | How `order-service` finds inventory | What not to do |
 |---|---|---|---|
 | Docker Compose | **This lab and local labs** | DNS name `http://inventory-service:8000` | hard-code laptop IPs |
@@ -958,6 +1380,16 @@ In the service, trust forwarded identity headers only when requests can come exc
 | Mesh | **Lab 8 onward** | call the Kubernetes service name; sidecar load-balances healthy endpoints | build a Python registry client alongside the platform registry |
 
 For the Compose lab, service names in `compose.yaml` are DNS names on Compose's default network. For Kubernetes, a `Service` gives a stable virtual address while Pods are created and removed; readiness gates which Pods become endpoints. The concept is the same, but the platform implementation differs.
+
+**Verify discovery:** from inside the `order-service` container, resolve the inventory name and call its health endpoint.
+
+```bash
+docker compose -f infra/compose.yaml exec -T order-service uv run python -c "
+import httpx
+print(httpx.get('http://inventory-service:8000/health').json())
+"
+# expect {'dependency': 'inventory', 'status': 'ok'}
+```
 
 <details>
 <summary><strong>Why not use Kubernetes discovery in Lab 4?</strong></summary>
@@ -983,7 +1415,12 @@ Because the learning objective is the gateway boundary and basic DNS discovery�
 
 ## Step 5.1: write the event in the same transaction
 
+**Problem:** the order is committed to Postgres and then published to Kafka. If the process dies between the two, the order exists but no one hears about it. If the publish happens first and the commit fails, consumers act on an order that does not exist.
+
+**Pattern:** write the event to an `outbox` table in the same transaction as the order. Both commit or both roll back. A separate publisher then relays unpublished rows to Kafka.
+
 ```sql
+-- Outbox table written in the same transaction as the order (Lab 5).
 CREATE TABLE outbox (
   id UUID PRIMARY KEY,
   aggregate_id UUID NOT NULL,
@@ -998,6 +1435,7 @@ CREATE INDEX outbox_unpublished_idx ON outbox (occurred_at) WHERE published_at I
 Inside the *same* transaction that inserts the order, allocate the event ID once and persist the complete event envelope:
 
 ```python
+# Write the OrderCreated event in the same transaction as the order.
 event_id = uuid4()
 await session.execute(text("""
   INSERT INTO outbox(id, aggregate_id, event_type, payload)
@@ -1011,7 +1449,9 @@ Now a publisher process may safely retry delivery:
 
 ```python
 # services/order_service/app/infrastructure/outbox_publisher.py — use SKIP LOCKED so replicas do not publish the same row concurrently
+# Publisher: send unpublished outbox rows to Kafka and mark them published.
 from json import dumps
+from sqlalchemy import text
 
 async def publish_batch(session, producer):
     async with session.begin():
@@ -1037,11 +1477,57 @@ Use the aggregate ID, not the event ID, as the Kafka key so all events for one o
 
 For high volume, use CDC (Debezium) to publish the outbox table. The transaction principle remains unchanged.
 
+**Verify atomicity:** temporarily add `raise RuntimeError("simulated crash")` directly after the `outbox` insert in `create_order`, send a valid order, and expect a `500`. Then compare counts before and after:
+
+```bash
+docker compose -f infra/compose.yaml exec -T postgres psql -U orders -d orders \
+  -c "select (select count(*) from orders) as orders, (select count(*) from outbox) as outbox;"
+# both counts must be unchanged after the failed request. Remove the raise afterward.
+```
+
+**Verify publishing:** after a normal request, the outbox row has `published_at IS NULL`. Run the publisher once, and the row must be marked published.
+
+```bash
+uv run --env-file .env python - <<'EOF'
+import asyncio
+from aiokafka import AIOKafkaProducer
+from services.order_service.app.infrastructure.db import SessionFactory
+from services.order_service.app.infrastructure.outbox_publisher import publish_batch
+
+async def main():
+    producer = AIOKafkaProducer(bootstrap_servers="localhost:9092")
+    await producer.start()
+    try:
+        async with SessionFactory() as session:
+            await publish_batch(session, producer)
+    finally:
+        await producer.stop()
+
+asyncio.run(main())
+EOF
+docker compose -f infra/compose.yaml exec -T postgres psql -U orders -d orders -c "select count(*) from outbox where published_at is null;"
+# expect 0
+```
+
 ## Step 5.2: accept at-least-once delivery
+
+**Problem:** the publisher can crash after Kafka accepts an event but before it marks the row published. The event is then sent again, so a consumer can process the same order twice.
+
+**Pattern:** the consumer records each processed event ID under a unique key in the same transaction as its work. A duplicate hits the conflict and does nothing.
 
 Kafka producer acknowledgement plus a database update is still not one global atomic transaction. A crash after Kafka accepts an event but before `published_at` commits means the event can be sent twice. Therefore consumers must be idempotent.
 
+**Verify the dedupe key:** create the `processed_events` table from the SQL above, then run the same insert twice. The first returns one row; the second returns none.
+
+```bash
+docker compose -f infra/compose.yaml exec -T postgres psql -U orders -d orders -c \
+  "INSERT INTO processed_events(consumer_name, event_id) VALUES ('shipping', '8bd1f4c2-0000-4000-8000-000000000001') ON CONFLICT DO NOTHING RETURNING event_id;"
+# first run: INSERT 0 1 with the event_id row
+# second run: INSERT 0 0
+```
+
 ```sql
+-- Consumer dedupe table keyed by consumer name and event ID.
 CREATE TABLE processed_events (
   consumer_name TEXT NOT NULL,
   event_id UUID NOT NULL,
@@ -1051,6 +1537,7 @@ CREATE TABLE processed_events (
 ```
 
 ```python
+# Idempotent consumer: skip events already recorded in processed_events.
 async def consume_shipping(event, session):
     async with session.begin():
         seen = await session.execute(text("""
@@ -1081,7 +1568,12 @@ async def consume_shipping(event, session):
 
 ## Step 6.1: model the saga states
 
+**Problem:** reserve stock, authorize payment, and create a shipment are three separate services. If shipping fails after payment, no single database transaction can undo the earlier steps.
+
+**Pattern:** an orchestrated saga. One component stores the order's state durably, moves it forward one step at a time, and runs a compensating action for each completed step when a later step fails.
+
 ```mermaid
+%% Saga states and the compensation transitions for each failure.
 stateDiagram-v2
   [*] --> PENDING
   PENDING --> STOCK_RESERVED: reserve succeeds
@@ -1094,6 +1586,7 @@ stateDiagram-v2
 Store saga state durably in the Order database. The workflow may be triggered by events; it must survive restarts and be safe to retry.
 
 ```python
+# Orchestrated saga step: advance an order using durable state and compensations.
 async def advance_order(order_id, inventory, payment, shipping, repo):
     order = await repo.lock_for_update(order_id)
     if order.status == "PENDING":
@@ -1127,6 +1620,10 @@ This is an **orchestrated saga**: one component owns the state machine. Choreogr
 
 ## Step 6.2: distinguish a compensation from rollback
 
+**Problem:** teams often assume a failed step can be rolled back. Stock release and payment capture happen in other systems, so the "undo" is a new business event, not an erased row.
+
+**Pattern:** design each compensation before its forward step, and decide which actions are irreversible and what happens then.
+
 `release inventory` cannot erase history. It creates a new business fact. A payment authorization can be voided; a settled payment needs a refund. Design compensations before the forward action and document the “irreversible” boundary.
 
 ### Failure clinic
@@ -1141,6 +1638,73 @@ This is an **orchestrated saga**: one component owns the state machine. Choreogr
 
 **Exercise:** make shipping return 503 after payment success. Show the order entering `COMPENSATION_PENDING`, then recover it after shipping/payment services come back.
 
+**Verify the compensation path:** save the `advance_order` function from Step 6.1 as `services/order_service/app/application/order_saga.py`, and define `ShippingUnavailable` and `PaymentDeclined` in that module. Then create `tests/test_order_saga.py`:
+
+```python
+# tests/test_order_saga.py
+from types import SimpleNamespace
+
+import pytest
+
+from services.order_service.app.application.order_saga import ShippingUnavailable, advance_order
+
+
+class FakeRepo:
+    def __init__(self, order):
+        self.order = order
+
+    async def lock_for_update(self, order_id):
+        return self.order
+
+    async def save(self, order):
+        pass
+
+
+class FakeInventory:
+    def __init__(self):
+        self.released = []
+
+    async def reserve(self, order_id, lines):
+        return "res-1"
+
+    async def release(self, reservation_id):
+        self.released.append(reservation_id)
+
+
+class FakePayment:
+    def __init__(self):
+        self.voided = []
+
+    async def authorize(self, order_id, total):
+        return "auth-1"
+
+    async def void(self, authorization_id):
+        self.voided.append(authorization_id)
+
+
+class FailingShipping:
+    async def create(self, order_id, lines):
+        raise ShippingUnavailable()
+
+
+@pytest.mark.asyncio
+async def test_shipping_failure_voids_payment_and_releases_stock():
+    order = SimpleNamespace(status="PENDING", lines=[], total=10,
+                            reservation_id=None, authorization_id=None, shipment_id=None)
+    inventory, payment = FakeInventory(), FakePayment()
+
+    await advance_order("o-1", inventory, payment, FailingShipping(), FakeRepo(order))
+
+    assert order.status == "CANCELLED"
+    assert payment.voided == ["auth-1"]
+    assert inventory.released == ["res-1"]
+```
+
+```bash
+uv run pytest tests/test_order_saga.py -v
+# expect PASSED: the failed shipment leaves no authorization held and no stock reserved
+```
+
 ---
 
 # Lab 7 — Use CQRS and event sourcing for the right problem
@@ -1149,9 +1713,14 @@ This is an **orchestrated saga**: one component owns the state machine. Choreogr
 
 ## Step 7.1: apply CQRS before event sourcing
 
+**Problem:** support dashboards need filtered, denormalized order timelines. Running those reports on the `orders` table slows order writes, and every schema change breaks the reports.
+
+**Pattern:** separate the write model from a read model. A projection consumer builds the read model from events, so queries never touch the command path.
+
 CQRS means **separate write and read models**, not necessarily separate databases or microservices. The command side protects invariants. The query side is optimized for questions.
 
 ```sql
+-- Read model for support dashboards, updated by projection consumers (Lab 7).
 CREATE TABLE order_summary (
   order_id UUID PRIMARY KEY,
   customer_id UUID NOT NULL,
@@ -1165,7 +1734,33 @@ CREATE TABLE order_summary (
 
 A projection consumer listens to versioned order events and upserts `order_summary`. `GET /v1/orders/{id}` can read this model. Tell callers its data is **eventually consistent**—a just-accepted order might not appear in a dashboard for seconds.
 
+**Verify the projection is idempotent:** apply the same `OrderCreated` event twice, as a redelivery would. Expect one summary row. Apply `order_summary` from Step 7.1 first.
+
+```bash
+uv run --env-file .env python - <<'EOF'
+import asyncio, uuid
+from sqlalchemy import text
+from services.order_service.app.infrastructure.db import SessionFactory
+from services.order_service.app.application.order_projection import apply_event
+
+async def main():
+    oid, cid = str(uuid.uuid4()), str(uuid.uuid4())
+    event = {"type": "OrderCreated", "data": {"order_id": oid, "customer_id": cid, "total": "49.90"}}
+    async with SessionFactory() as session:
+        async with session.begin():
+            await apply_event(event, session)
+            await apply_event(event, session)  # duplicate delivery
+    async with SessionFactory() as session:
+        rows = (await session.execute(
+            text("select count(*) from order_summary where order_id = :id"), {"id": oid})).scalar()
+        print("summary rows:", rows)  # expect 1
+
+asyncio.run(main())
+EOF
+```
+
 ```python
+# Projection handler: apply order events to the order_summary read model.
 async def apply_event(event, session):
     # Do dedupe/version checks first (see Lab 5).
     if event["type"] == "OrderCreated":
@@ -1180,9 +1775,14 @@ async def apply_event(event, session):
 
 ## Step 7.2: event sourcing is a stronger choice
 
+**Problem:** two commands read the same order and both append a change, so one silently overwrites the other.
+
+**Pattern:** store the event stream as the source of truth and enforce an expected version on every append. A stale writer fails on the primary key instead of overwriting.
+
 In event sourcing, the event stream is the source of truth; current order state is rebuilt by applying events.
 
 ```sql
+-- Event store: append-only events per order, keyed by version (Lab 7).
 CREATE TABLE order_events (
   order_id UUID NOT NULL,
   version INTEGER NOT NULL,
@@ -1197,11 +1797,24 @@ CREATE TABLE order_events (
 Append with optimistic concurrency:
 
 ```sql
+-- Optimistic-concurrency append: fails if the expected version is stale.
 INSERT INTO order_events(order_id, version, event_id, event_type, data)
 VALUES (:order_id, :expected_version + 1, :event_id, 'StockReserved', :data);
 ```
 
 If another command already appended version 5, the primary-key collision tells you your state was stale. Reload events, re-evaluate the command, and either retry or reject.
+
+**Verify optimistic concurrency:** append version 1 twice. The first insert succeeds; the second must fail on the primary key.
+
+```bash
+docker compose -f infra/compose.yaml exec -T postgres psql -U orders -d orders <<'SQL'
+INSERT INTO order_events(order_id, version, event_id, event_type, data)
+VALUES ('11111111-2222-3333-4444-555555555555', 1, gen_random_uuid(), 'StockReserved', '{}');
+INSERT INTO order_events(order_id, version, event_id, event_type, data)
+VALUES ('11111111-2222-3333-4444-555555555555', 1, gen_random_uuid(), 'StockReserved', '{}');
+SQL
+# second insert: ERROR: duplicate key value violates unique constraint "order_events_pkey"
+```
 
 Do not use event sourcing merely because it sounds advanced. It earns its complexity when immutable audit history, temporal reconstruction, and multiple independent projections are central product needs (financial ledger, compliance, complex order lifecycle). For many services, the Lab 2 transactional model plus Lab 5 outbox is the better default.
 
@@ -1222,9 +1835,14 @@ Do not use event sourcing merely because it sounds advanced. It earns its comple
 
 ## Step 8.0: create the optional local Kubernetes platform
 
+**Problem:** the same service runs differently in Compose and in a cluster, so platform concerns such as probes, sidecars, and routing are untested until production.
+
+**Pattern:** a local cluster with Istio, so the platform behavior can be checked before a production rollout.
+
 Complete this once, only after Labs 0-7 work in Compose. If you use Minikube, translate the `kind` image-loading command in Step 8.1; the Kubernetes manifests remain the same.
 
 ```bash
+# Create a local kind cluster and confirm Istio is running.
 kind create cluster --name workshop
 istioctl install --set profile=demo -y
 kubectl get nodes
@@ -1233,11 +1851,22 @@ kubectl get pods -n istio-system
 
 Expected result: the cluster has one Ready control-plane node and the Istio control-plane Pods are Running. If `istioctl` is unavailable, install it from the official Istio release matching the version you intend to use; do not continue with the mesh exercises without a working control plane.
 
+**Verify the control plane:**
+
+```bash
+istioctl verify-install   # expect no errors
+```
+
 ## Step 8.1: promote the same image built in Lab 4
+
+**Problem:** a separate image for the cluster means the tested artifact is not the deployed artifact.
+
+**Pattern:** promote one image by identity. Build it once, load or push that exact build, and reference it by a version or digest in every environment.
 
 Lab 4 already created the **services/order_service/Dockerfile** so learners do not maintain separate “Compose” and “Kubernetes” images. Build the identical source once, then deploy its immutable digest to each environment.
 
 ```bash
+# Build the image once and load it into the local cluster.
 docker build -t order-service:workshop -f services/order_service/Dockerfile .
 
 # Choose exactly one local-cluster loading command.
@@ -1245,13 +1874,25 @@ kind load docker-image order-service:workshop --name workshop
 # minikube image load order-service:workshop
 ```
 
+**Verify the image is in the cluster** (kind example; the node name is `<cluster>-control-plane`):
+
+```bash
+docker exec workshop-control-plane crictl images | grep order-service
+# expect an order-service:workshop row
+```
+
 For a real registry, replace **order-service:workshop** with a versioned image digest. Inject configuration/secrets at runtime. Never bake environment files, API keys, or database URLs into the image.
 
 ## Step 8.2: deploy statelessly
 
+**Problem:** a service that keeps state in memory or depends on Pod identity cannot survive restarts, rollouts, or autoscaling. Its health checks must also match what it actually needs to serve traffic.
+
+**Pattern:** keep the Pod stateless, configure it through a Secret, and split probes: `startupProbe` covers slow startup, `livenessProbe` restarts a dead process, and `readinessProbe` controls traffic.
+
 Create the namespace and inject the sidecar **before** creating the Deployment:
 
 ```bash
+# Create the namespace and enable sidecar injection before the Deployment, then store secrets.
 kubectl create namespace orders
 kubectl label namespace orders istio-injection=enabled
 kubectl -n orders create secret generic order-service-secrets \
@@ -1266,6 +1907,7 @@ kubectl -n orders create secret generic order-service-secrets \
 
 ```yaml
 # k8s/base/order-service.yaml
+# Deployment, Service, and HPA for order-service with probes and secrets.
 apiVersion: apps/v1
 kind: Deployment
 metadata: { name: order-service }
@@ -1320,6 +1962,7 @@ spec:
 ```
 
 ```bash
+# Deploy to the orders namespace and check sidecar, readiness, and liveness.
 kubectl -n orders apply -f k8s/base/order-service.yaml
 kubectl -n orders get pods,svc,hpa
 kubectl -n orders get pod -l app=order-service -o jsonpath='{.items[0].spec.containers[*].name}'
@@ -1330,9 +1973,20 @@ curl -i http://localhost:8080/livez
 
 Expected result: the container list includes **app istio-proxy**, at least two Pods become ready, and **/livez** returns **200**. If **istio-proxy** is absent, stop and verify that Istio is installed and the namespace label existed before Pod creation.
 
+**Verify the rollout and probes:** the Deployment must become ready, and a Pod must receive traffic only when ready.
+
+```bash
+kubectl -n orders rollout status deployment/order-service   # expect: successfully rolled out
+kubectl -n orders get pods -l app=order-service              # expect READY 2/2 for each Pod
+```
+
 The HPA is included to show the resource-scaling contract. Run `kubectl -n orders get hpa`. If CPU shows `<unknown>`, your local cluster has no Metrics Server; install/enable it before trying to validate CPU scaling. Lab 9 explains why queue lag and concurrency limits are often better scaling signals for asynchronous workers.
 
 ## Step 8.3: understand the sidecar pattern
+
+**Problem:** every service re-implements mTLS, retries, and telemetry, and each implementation drifts.
+
+**Pattern:** a sidecar proxy beside each Pod handles those concerns uniformly. The application keeps its business logic.
 
 A **sidecar** is a helper container running beside the application in the same Pod. It shares lifecycle/network namespace but owns a cross-cutting concern. Examples: Envoy proxy, log shipper, secret agent.
 
@@ -1340,12 +1994,23 @@ The service mesh injects an Envoy sidecar. Calls from FastAPI to `inventory-serv
 
 **Important boundary:** do not apply retry both in FastAPI *and* in the mesh without a single retry budget. Two layers of three retries can create nine requests; add a gateway retry and it can become 27.
 
+**Verify the sidecar is attached and synced:**
+
+```bash
+istioctl proxy-status | grep order-service   # expect SYNCED for each order-service Pod
+```
+
 ## Step 8.4: translate the local gateway path to an Istio ingress gateway
+
+**Problem:** the Kong gateway from Lab 4 does not exist in the cluster, so the same external path must be recreated with the platform's own gateway.
+
+**Pattern:** an Istio ingress `Gateway` plus `VirtualService` rewrites `/api` to the service's paths, matching the Lab 4 contract.
 
 Kong is the local Compose gateway in Lab 4. In this Kubernetes lab, use Istio’s ingress gateway so you can observe one platform-owned north-south entry point alongside the sidecar mesh. In a real platform, choose the organization-standard gateway; do not expose both Kong and Istio gateway for the same API path without a clear reason.
 
 ```yaml
 # k8s/istio/order-ingress.yaml
+# Istio ingress: expose /api through the platform gateway (Lab 8).
 apiVersion: networking.istio.io/v1
 kind: Gateway
 metadata: { name: orders-gateway }
@@ -1376,6 +2041,7 @@ spec:
 ```
 
 ```bash
+# Apply the ingress and verify the /api rewrite through Istio.
 kubectl -n orders apply -f k8s/istio/order-ingress.yaml
 kubectl -n istio-system port-forward service/istio-ingressgateway 8080:80
 # In another terminal:
@@ -1386,8 +2052,13 @@ Expected result: the ingress gateway rewrites `/api/livez` to the service's `/li
 
 ## Step 8.5: make mesh traffic policy explicit
 
+**Problem:** a slow or failing payment Pod keeps receiving traffic and holds connections, and the application alone must absorb the damage.
+
+**Pattern:** mesh policy limits connections, ejects Pods that return repeated `5xx` errors, and sets a proxy timeout. This protects the platform before the application's own breaker opens.
+
 ```yaml
 # k8s/istio/payment-policy.yaml
+# Payment DestinationRule (mTLS, connection limits, outlier detection) and VirtualService timeout.
 apiVersion: networking.istio.io/v1
 kind: DestinationRule
 metadata: { name: payment-service }
@@ -1413,6 +2084,13 @@ spec:
 ```
 
 This is circuit-breaking-like **traffic protection** at the proxy layer. It does not replace application-level business handling: FastAPI still decides whether to queue the order, compensate, or report a retryable error.
+
+**Verify the policy is valid:**
+
+```bash
+istioctl analyze -n orders   # expect no errors for DestinationRule or VirtualService
+kubectl -n orders get destinationrule payment-service -o jsonpath='{.spec.trafficPolicy.outlierDetection}'; echo
+```
 
 ### Failure clinic
 
@@ -1522,6 +2200,10 @@ The original one-day workshop covers the core request, data, and workflow patter
 
 ## Step 9.1: separate three controls
 
+**Problem:** a tenant can stay under its request quota and still send sixty expensive operations at once. Rate limiting alone does not protect capacity.
+
+**Pattern:** three separate controls: a rate limit for fairness per tenant, a concurrency limit for expensive work, and load shedding for non-critical requests when the system is under pressure.
+
 | Control | Decision | Typical location |
 |---|---|---|
 | Rate limit | “Has this tenant/user exceeded an agreed quota?” | gateway or Redis-backed limiter |
@@ -1530,7 +2212,18 @@ The original one-day workshop covers the core request, data, and workflow patter
 
 Do not treat them as the same thing. A tenant can remain within its 60 requests/minute quota yet still trigger 60 expensive LLM, payment, or database operations simultaneously.
 
+**Verify the burst behavior:** send 200 requests with 50 in parallel. The gateway quota should return some `429`s, and the total must never reach the service faster than the limit allows.
+
+```bash
+seq 200 | xargs -P 50 -I{} curl -s -o /dev/null -w "%{http_code}\n" localhost:8000/api/livez | sort | uniq -c
+# expect 200s up to the quota and 429s for the rest
+```
+
 ## Step 9.2: apply a distributed rate limit at the gateway
+
+**Problem:** an in-memory counter in each gateway replica gives each tenant a different effective quota depending on which replica receives the request.
+
+**Pattern:** one shared bucket per tenant in Redis, keyed by the credential that identifies the tenant, so every replica enforces the same limit.
 
 Use the gateway or Envoy rate-limit service for the first protection layer. The key must represent a real fairness boundary: tenant ID, API key, user ID, or client application—not just source IP.
 
@@ -1548,10 +2241,22 @@ plugins:
 
 Return `429 Too Many Requests` with `Retry-After`. Never silently queue an interactive request for minutes; callers need an explicit asynchronous job API for that experience.
 
+**Verify the rejection contract:** once the tenant quota is exhausted, the response is `429` and includes `Retry-After` (when the Redis-backed policy is configured). Confirm with headers:
+
+```bash
+curl -s -D - -o /dev/null localhost:8000/api/livez | grep -iE "^(HTTP|retry-after)"
+# after the quota is exhausted: HTTP/1.1 429 and a Retry-After line
+```
+
 ## Step 9.3: bound expensive in-process work
+
+**Problem:** unlimited expensive work fills every worker, connection pool, and queue, and even the health endpoint slows down.
+
+**Pattern:** a semaphore caps concurrent expensive operations. The time budget applies only to waiting for a slot, so a request that cannot get capacity is refused quickly with `503` and `Retry-After`. Once a slot is held, the operation is not cancelled by the wait budget.
 
 ```python
 # services/order_service/app/application/admission.py
+# Bound expensive work with a semaphore; refuse with 503 when no slot frees up in time.
 import asyncio
 from fastapi import HTTPException
 
@@ -1559,21 +2264,66 @@ expensive_work_slots = asyncio.Semaphore(25)
 
 async def run_expensive_work(operation):
     try:
-        async with asyncio.timeout(0.05):
-            async with expensive_work_slots:
-                return await operation()
+        async with asyncio.timeout(0.05):  # budget for waiting, not for the operation
+            await expensive_work_slots.acquire()
     except TimeoutError:
         # The service is deliberately refusing work before it causes a wider outage.
         raise HTTPException(503, "System busy. Retry shortly.", headers={"Retry-After": "2"})
+    try:
+        return await operation()
+    finally:
+        expensive_work_slots.release()
+```
+
+**Verify the admission limit:** create `tests/test_admission.py`. Forty callers each run a 0.2-second operation: 25 get slots, and the other 15 wait longer than the 0.05-second budget.
+
+```python
+# tests/test_admission.py
+import asyncio
+
+import pytest
+from fastapi import HTTPException
+
+from services.order_service.app.application.admission import run_expensive_work
+
+
+async def slow_operation():
+    await asyncio.sleep(0.2)
+    return "ok"
+
+
+@pytest.mark.asyncio
+async def test_excess_work_is_refused_with_503():
+    results = await asyncio.gather(
+        *(run_expensive_work(slow_operation) for _ in range(40)),
+        return_exceptions=True,
+    )
+    refused = [r for r in results if isinstance(r, HTTPException)]
+    succeeded = [r for r in results if r == "ok"]
+    assert len(succeeded) == 25
+    assert len(refused) == 15
+    assert all(r.status_code == 503 for r in refused)
+```
+
+```bash
+uv run pytest tests/test_admission.py -v
+# expect PASSED: 25 succeed, 15 receive 503
 ```
 
 Use a separate limit per dependency or workload class. Checkout may deserve reserved capacity; report generation or a bulk re-index request should not consume it.
 
+**Verify the time budget** is applied to waiting only. Run the `test_admission.py` test above, then change the operation to 0.01 seconds: all 40 calls must succeed, because no caller waits longer than the budget.
+
 ## Step 9.4: turn non-interactive work into a queue
+
+**Problem:** a 100,000-order export keeps an HTTP connection open for minutes, ties up a worker, and times out on the client.
+
+**Pattern:** persist the job, return `202` with a status URL immediately, and let queued workers drain the work at a rate they can sustain.
 
 Example: a customer requests a 100,000-order export. Do not keep an HTTP connection open while the API scans data. Persist a job, publish `ExportRequested`, and return `202` plus a job URL.
 
 ```python
+# Export endpoint returns 202 and enqueues work; worker drains at a fixed rate.
 @router.post("/exports", status_code=202)
 async def request_export(body = Body(...)):
     job_id = create_export_job(body)       # durable database row: QUEUED
@@ -1588,6 +2338,14 @@ async def handle_export(event):
 ```
 
 This is **queue-based load leveling**. The queue absorbs a burst; worker concurrency controls drain rate. It is not a license for infinite backlog: monitor oldest message age and reject/defer work before promised completion times become impossible.
+
+**Verify the request path returns quickly:** enqueueing must not depend on job size. Time the request, then check the job status.
+
+```bash
+time curl -s -o /dev/null -w "%{http_code}\n" -X POST localhost:8000/v1/exports \
+  -H 'content-type: application/json' -d '{"tenant_id":"tenant-a","rows":100000}'
+# expect 202 in milliseconds, not seconds
+```
 
 ### Failure clinic
 
@@ -1609,6 +2367,10 @@ This is **queue-based load leveling**. The queue absorbs a burst; worker concurr
 
 ## Step 10.1: use an explicit event envelope
 
+**Problem:** events are shaped by whatever the producer happened to serialize. Consumers cannot dedupe, trace, or route them reliably, and a field rename breaks everyone.
+
+**Pattern:** a fixed envelope (ID, type, schema version, time, correlation ID, data) that is versioned as a public contract.
+
 ```json
 {
   "event_id": "8bd1...",
@@ -1628,7 +2390,12 @@ The envelope gives consumers the fields they need for dedupe, tracing, routing, 
 
 ## Step 10.2: classify failures before retrying
 
+**Problem:** retrying every exception keeps a poison message in an infinite loop, and blocking the consumer with `sleep` stalls the whole partition.
+
+**Pattern:** classify each outcome. Retry only transient failures, a bounded number of times, using delayed retry topics. Send everything else to a dead-letter queue (DLQ) for repair and replay.
+
 ```python
+# Classify failures to decide success, retry, DLQ, or unknown handling.
 async def process_message(event):
     try:
         await create_shipment(event["data"])
@@ -1656,7 +2423,18 @@ async def consume(event, attempt):
 
 Use delayed retry topics/queues such as `retry.1m`, `retry.5m`, and `retry.30m`; do **not** block a Kafka consumer with `sleep(300)`. A DLQ is not a trash can. It needs an owner, dashboard, alert threshold, repair workflow, and a safe replay tool.
 
+**Verify the DLQ route:** publish one event that always fails the classification (for example, an invalid address), then read the DLQ topic. It must appear after the bounded attempts, with its reason.
+
+```bash
+docker compose -f infra/compose.yaml exec -T redpanda rpk topic consume orders.dlq -n 1
+# expect a record containing "reason": "business_failure"
+```
+
 ## Step 10.3: evolve additively first
+
+**Problem:** a producer renames or removes a field during a rolling deploy. Old consumers still running on other Pods fail, and the failure appears only after the deploy.
+
+**Pattern:** change contracts additively. New fields are optional, consumers ignore unknown fields, and only a true semantic break gets a new version.
 
 Safe default rules:
 
@@ -1666,6 +2444,7 @@ Safe default rules:
 - Keep old producers/consumers working during the deployment overlap.
 
 ```python
+# Additive schema versioning: normalize v1 and v2 OrderCreated events.
 def normalize_order_created(event):
     version = event.get("schema_version", 1)
     data = event["data"]
@@ -1680,7 +2459,12 @@ def normalize_order_created(event):
 
 ## Step 10.4: test the contract in CI
 
+**Problem:** a change that looks safe in review still breaks a consumer, and nobody notices until production.
+
+**Pattern:** keep real historical events as fixtures and replay them through the current consumer code in CI.
+
 ```python
+# Contract tests that replay historical event fixtures through the consumer.
 # Keep representative historical events in tests/contracts/.
 async def test_shipping_accepts_order_created_v1():
     event = load_json("tests/contracts/order-created-v1.json")
@@ -1694,6 +2478,13 @@ async def test_shipping_accepts_order_created_v2():
 ```
 
 At larger scale use a schema registry (Avro, Protobuf, or JSON Schema) and block incompatible producer changes in CI. The schema registry does not replace semantic tests: a field can remain syntactically compatible while its business meaning changes.
+
+**Verify the contract tests:** save `normalize_order_created` and both tests in `tests/test_order_created_contract.py`. Create `tests/contracts/order-created-v1.json` (no `currency`) and `tests/contracts/order-created-v2.json` (`"currency": "INR"`), then run:
+
+```bash
+uv run pytest tests/test_order_created_contract.py -v
+# expect 2 PASSED
+```
 
 ### Failure clinic
 
@@ -1713,8 +2504,13 @@ At larger scale use a schema registry (Avro, Protobuf, or JSON Schema) and block
 
 ## Step 11.1: carry a trace across every hop
 
+**Problem:** logs show "payment timeout" in one service, but nothing ties that line to the order request, the gateway call, or the saga step that caused it.
+
+**Pattern:** OpenTelemetry spans propagate a `traceparent` header across HTTP and Kafka, so every hop records the same trace ID.
+
 ```python
 # services/order_service/app/observability.py
+# Configure OpenTelemetry tracing for FastAPI and outbound httpx calls.
 from opentelemetry import trace
 from opentelemetry.instrumentation.fastapi import FastAPIInstrumentor
 from opentelemetry.instrumentation.httpx import HTTPXClientInstrumentor
@@ -1732,9 +2528,21 @@ def configure_observability(app):
 
 OpenTelemetry propagates `traceparent` on HTTP calls. Include the current trace/correlation ID in Kafka headers too, then consumer spans can join the same end-to-end order timeline.
 
+**Verify propagation:** send a request with a known trace ID, then find that trace in your OpenTelemetry backend (an OTLP collector or Jaeger listening on port 4317).
+
+```bash
+curl -s -o /dev/null -H 'traceparent: 00-4bf92f3577b34da6a3ce929d0e0e4736-00f067aa0ba902b7-01' localhost:8000/api/livez
+# search the backend for trace ID 4bf92f3577b34da6a3ce929d0e0e4736: the order-service span must be present
+```
+
 ## Step 11.2: use structured logs and meaningful metrics
 
+**Problem:** unstructured logs cannot be filtered by order or outcome, and metrics labeled with IDs overload Prometheus.
+
+**Pattern:** log key-value events that name the operation and outcome, and record RED metrics (rate, errors, duration) with only low-cardinality labels.
+
 ```python
+# Structured logs and failure logging for payment authorization.
 import structlog
 
 log = structlog.get_logger()
@@ -1752,7 +2560,17 @@ async def authorize_order(order_id, customer_id, total):
 
 Record **RED metrics** for each API: Rate, Errors, Duration. Record queue depth/oldest age for consumers and breaker state/concurrency for dependencies. Avoid a metric label such as `order_id` or `customer_id`; it creates unbounded time-series cardinality and can overload Prometheus.
 
+**Verify the labels:** after exposing `/metrics` (the `prometheus-fastapi-instrumentator` dependency provides it), no metric may carry an ID label.
+
+```bash
+curl -s localhost:8000/metrics | grep -c 'order_id='   # expect 0
+```
+
 ## Step 11.3: define service-level objectives
+
+**Problem:** alerts fire on every 500, so engineers ignore them. Nobody can say whether users are actually affected.
+
+**Pattern:** an SLO states the target. The error budget is what the target allows to fail, and alerts fire on how fast that budget is being spent.
 
 Example checkout SLO:
 
@@ -1764,6 +2582,8 @@ Example checkout SLO:
 | Event health | 99.9% events leave outbox in under 60 seconds | outbox lag or DLQ age breaches target |
 
 Alert on user impact and fast budget burn—not every single 500. An isolated failed request is a log/tracing event; an alert means action is required now.
+
+**Verify the budget math:** a 99.9% monthly availability SLO on 1,000,000 valid requests allows 1,000 failures. 1,000 failures over 730 hours (one month) is about 1.4 failures per hour. A burn rate of 10 times that is about 14 failures per hour; your burn-rate alert should page at that rate.
 
 ### Failure clinic
 
@@ -1784,6 +2604,10 @@ Alert on user impact and fast budget burn—not every single 500. An isolated fa
 
 ## Step 12.1: separate human, workload, and permission identity
 
+**Problem:** network location is treated as identity. Any Pod that can reach `order-service` can send a forged `X-User-Id` header and act as an admin.
+
+**Pattern:** verify three identities separately: the end user (token), the calling workload (mTLS identity), and the permission (scopes and tenant policy).
+
 | Identity | Example | Verification |
 |---|---|---|
 | End user | customer placing an order | gateway validates OIDC access token |
@@ -1792,10 +2616,22 @@ Alert on user impact and fast budget burn—not every single 500. An isolated fa
 
 The gateway verifies external JWTs and passes trusted claims only through an authenticated internal path. A sensitive service should also validate the token or receive a short-lived signed internal identity token; do not blindly trust arbitrary headers.
 
+**Verify (after replacing the placeholder principal with real token validation):** a forged header must not grant access.
+
+```bash
+curl -s -o /dev/null -w "%{http_code}\n" -X POST -H 'X-User-Id: admin' localhost:8000/v1/orders/11111111-1111-1111-1111-111111111111/cancel
+# expect 401 with no valid token
+```
+
 ## Step 12.2: enforce permissions in the application
+
+**Problem:** checking a scope proves the caller may cancel orders, but not which orders. A support agent from one tenant can cancel another tenant's order.
+
+**Pattern:** a scope dependency for the operation, plus a tenant predicate on every data lookup, so a foreign resource looks the same as a missing one.
 
 ```python
 # services/order_service/app/api/security.py
+# Scope-based authorization dependency for protected routes.
 from fastapi import Depends, HTTPException
 
 def current_principal():
@@ -1817,9 +2653,22 @@ async def cancel_order(order_id, principal = Depends(require_scope("orders:cance
 
 Authorization must include the resource boundary. Having `orders:cancel` is insufficient if a support agent from tenant A can cancel tenant B’s order. The domain lookup must constrain by tenant/ownership.
 
+**Verify the tenant boundary** with a valid token for tenant A and an order that belongs to tenant B:
+
+```bash
+curl -s -o /dev/null -w "%{http_code}\n" -X POST -H "Authorization: Bearer $TENANT_A_TOKEN" \
+  localhost:8000/v1/orders/<tenant-b-order-id>/cancel
+# expect 404: a 403 would reveal that the order exists
+```
+
 ## Step 12.3: restrict network paths with mesh policy
 
+**Problem:** a compromised or misconfigured workload in the same namespace can call the payment service directly, even though only order-service should.
+
+**Pattern:** a mesh `AuthorizationPolicy` allows calls only from the identity of the order-service workload, so the network path itself enforces who may call.
+
 ```yaml
+# Istio AuthorizationPolicy: only order-service may call payment /authorizations.
 apiVersion: security.istio.io/v1
 kind: AuthorizationPolicy
 metadata:
@@ -1839,6 +2688,14 @@ spec:
 
 Use a secret manager and workload identity to obtain secrets dynamically. Do not put API keys in images, ConfigMaps, Git, log messages, traces, or exception responses. Rotate secrets and signing keys without downtime.
 
+**Verify the mesh policy:** a probe running as a different identity must be refused.
+
+```bash
+kubectl -n orders run probe --rm -i --restart=Never --image=curlimages/curl -- \
+  curl -s -o /dev/null -w "%{http_code}\n" -X POST http://payment-service/authorizations
+# expect 403 (RBAC denied by the sidecar)
+```
+
 ### Failure clinic
 
 | Symptom | Cause | Fix |
@@ -1856,9 +2713,14 @@ Use a secret manager and workload identity to obtain secrets dynamically. Do not
 
 ## Step 13.1: use expand-migrate-contract for database changes
 
+**Problem:** a rolling deploy runs old and new code at the same time. Dropping or renaming a column in one release breaks the Pods still running the old version.
+
+**Pattern:** expand the schema first (add, keep the old column), migrate the data and code, and contract (drop) only after no reader depends on the old shape.
+
 Example: replace `orders.customer_email` with `customer_id`.
 
 ```sql
+-- Expand-migrate-contract: add the new column, backfill, then drop the old one.
 -- Release A: EXPAND. Old code still works.
 ALTER TABLE orders ADD COLUMN customer_id UUID NULL;
 
@@ -1872,9 +2734,16 @@ ALTER TABLE orders DROP COLUMN customer_email;
 
 Never combine a destructive schema change with the first deployment that stops using it. The same rule applies to event fields and external API versions.
 
+**Verify the expand phase:** after Release A and before the contract step, run the previous release's `INSERT` against the migrated schema. It must succeed, which shows the expand step is backward compatible.
+
 ## Step 13.2: use a feature flag for behavior changes
 
+**Problem:** a new payment path needs to ship with the code but serve traffic only when it is ready, and it must be switched off without a redeploy.
+
+**Pattern:** a feature flag selects the path per tenant at runtime, with a safe default so a flag-service outage keeps the old behavior.
+
 ```python
+# Feature flag selects the payment path per tenant with a safe default.
 async def select_payment_path(order):
     if feature_flags.enabled("payment-v2", tenant_id=order["tenant_id"]):
         return await payment_v2.authorize(order)
@@ -1883,9 +2752,16 @@ async def select_payment_path(order):
 
 Feature flags need owners, expiry dates, audit history, and a safe default. A permanent forest of flags becomes hidden distributed configuration and makes incidents harder to debug.
 
+**Verify both branches:** with a fake flag client, test that the flag off calls `payment_v1.authorize`, and the flag on for one tenant calls `payment_v2.authorize`. Assert which fake was called, not only the result.
+
 ## Step 13.3: canary traffic before full rollout
 
+**Problem:** a new release that breaks checkout reaches every customer at once if it is switched on in one step.
+
+**Pattern:** send a small weight of traffic to the canary subset, compare it with the stable version on errors, latency, and business outcomes, then promote or roll back.
+
 ```yaml
+# Istio weighted canary split: 95% stable, 5% canary.
 apiVersion: networking.istio.io/v1
 kind: VirtualService
 metadata: { name: order-service }
@@ -1901,9 +2777,16 @@ spec:
 
 Promote only after comparing canary versus stable on request errors, latency, outbox lag, DLQ rate, and business outcomes such as payment authorization success. A technical `200` can still represent a broken order workflow.
 
+**Verify the traffic split:** send 200 requests through the mesh and count responses per subset in Prometheus with `sum by (destination_version) (istio_requests_total{destination_service_name="order-service"})`. At a 5% weight, expect about 10 canary requests.
+
 ## Step 13.4: drain before termination
 
+**Problem:** Kubernetes stops a Pod while requests and messages are still in flight. Those requests fail, and some work is processed twice.
+
+**Pattern:** fail readiness first, so no new traffic arrives, then finish in-flight work within the grace period before the process exits.
+
 ```yaml
+# Drain: fail readiness, sleep in preStop, and allow a long termination grace period.
 spec:
   terminationGracePeriodSeconds: 45
   containers:
@@ -1915,6 +2798,16 @@ spec:
 ```
 
 The readiness endpoint must turn unhealthy before process exit so Kubernetes and the mesh stop routing new traffic. The application then stops consuming new messages, finishes in-flight work within a bounded time, commits offsets/transactions, and closes connections.
+
+**Verify zero errors during termination:** keep requests flowing through the ingress (port-forward from Step 8.4) while one Pod is deleted.
+
+```bash
+(for i in $(seq 300); do curl -s -o /dev/null -w "%{http_code}\n" localhost:8080/api/livez; sleep 0.1; done) | sort | uniq -c > /tmp/drain.txt &
+POD=$(kubectl -n orders get pods -l app=order-service -o name | head -1)
+kubectl -n orders delete "$POD" --wait=false
+wait; cat /tmp/drain.txt
+# expect only 200 lines: no 5xx while the Pod terminates
+```
 
 ### Failure clinic
 
@@ -1933,7 +2826,12 @@ The readiness endpoint must turn unhealthy before process exit so Kubernetes and
 
 ## Step 14.1: use cache-aside only for safely stale reads
 
+**Problem:** every catalog read goes to the database, which becomes the bottleneck as traffic grows.
+
+**Pattern:** cache-aside. Read the cache first, load from the database on a miss, and store the result with a TTL. Use it only where stale data is acceptable.
+
 ```python
+# Cache-aside read with a 60-second TTL.
 async def get_catalog_item(sku):
     key = f"catalog:{sku}"
     cached = await redis.get(key)
@@ -1950,9 +2848,16 @@ async def get_catalog_item(sku):
 
 Cache-aside is appropriate for product catalog, configuration, and precomputed summaries. Do not use it as the primary authority for payment balance, stock reservation, or an order’s current saga state without carefully defined consistency rules.
 
+**Verify the TTL behavior:** with an empty cache, make 1,000 reads for one SKU within 60 seconds. The repository must be called once, and once more after the TTL expires.
+
 ## Step 14.2: prevent cache stampedes
 
+**Problem:** a popular key expires, and every concurrent request misses the cache and queries the database at the same moment.
+
+**Pattern:** single-flight. Only one caller per key refreshes the cache; the others wait and then read the fresh value.
+
 ```python
+# Local single-flight lock to prevent stampedes inside one replica.
 import asyncio
 
 refresh_slots = {}
@@ -1969,7 +2874,13 @@ async def get_catalog_item_singleflight(sku):
 
 This local “single-flight” lock prevents a stampede only inside one replica. For cross-replica hot keys, prefer probabilistic early refresh, stale-while-revalidate, or a carefully bounded distributed lease. Never use a distributed lock as the first response to ordinary concurrency; it adds its own availability failure mode.
 
+**Verify single-flight:** launch 50 concurrent `get_catalog_item_singleflight("SKU-1")` calls against an empty cache. The fake repository's `get` must be called once, not 50 times.
+
 ## Step 14.3: make ownership explicit
+
+**Problem:** when services share tables, a schema change in one service silently breaks another, and deployments must be coordinated.
+
+**Pattern:** each service owns its data. Other services use its API or events, never its tables.
 
 | Data | Owning service | How other services use it |
 |---|---|---|
@@ -1980,7 +2891,18 @@ This local “single-flight” lock prevents a stampede only inside one replica.
 
 No service writes another service’s database tables. A shared database makes a local schema change a hidden distributed deployment. Use an anti-corruption layer at boundaries: translate external/legacy concepts into your own domain commands rather than allowing their model to leak throughout the system.
 
+**Verify ownership:** no other service's code may read the order tables.
+
+```bash
+grep -rln "FROM orders" services | grep -v "services/order_service" || echo "no cross-service table access"
+# expect: no cross-service table access
+```
+
 ## Step 14.4: choose partitions and regional recovery intentionally
+
+**Problem:** a backup that has never been restored is not a recovery plan. Without measured RPO (how much data can be lost) and RTO (how long recovery takes), a failover is a guess.
+
+**Pattern:** choose partitioning and regional strategy from the RPO and RTO you have measured, not from scale alone.
 
 | Need | Pattern | Design question |
 |---|---|---|
@@ -1990,6 +2912,14 @@ No service writes another service’s database tables. A shared database makes a
 | global low-latency writes | multi-region ownership/partitioning | which region owns a given order to avoid conflicting writes? |
 
 Start with a tested backup and restore, then regional failover drills. Multi-region active-active writes are a product and data-consistency decision, not a switch on a load balancer. Use them only when the RPO/RTO and latency requirements justify the complexity.
+
+**Verify with a restore drill:** back up, restore into a scratch database, and time it. The restore time is your measured RTO; the newest `created_at` in the restored data shows the data-loss window (RPO).
+
+```bash
+docker compose -f infra/compose.yaml exec -T postgres pg_dump -U orders -Fc orders > /tmp/orders.dump
+docker compose -f infra/compose.yaml exec -T postgres createdb -U orders orders_restore
+time docker compose -f infra/compose.yaml exec -T postgres pg_restore -U orders -d orders_restore < /tmp/orders.dump
+```
 
 ### Failure clinic
 
@@ -2090,6 +3020,7 @@ Scope validation is necessary but insufficient. The repository query itself must
 Complete the blanks before opening the answer:
 
 ```text
+# Pattern-selection exercise; answers are below.
 1. Database commit succeeds, event publish is lost      -> __________
 2. Slow payment dependency consumes every worker        -> __________
 3. Consumer fails forever on malformed event            -> __________
@@ -2136,6 +3067,7 @@ docker compose -f infra/compose.yaml down
 ### Compose gateway environment: Labs 4-7 and 9-11
 
 ```bash
+# Compose gateway stack: build, follow logs, and smoke-test /api.
 docker compose -f infra/compose.yaml up --build -d
 docker compose -f infra/compose.yaml logs -f kong order-service
 
@@ -2146,6 +3078,7 @@ curl -i http://localhost:8000/api/livez
 ### Kubernetes platform environment: Lab 8 and platform parts of Labs 12-13
 
 ```bash
+# Kubernetes context and log checks for the orders namespace.
 kubectl config current-context
 kubectl get namespace orders
 kubectl -n orders get pods,svc,hpa
